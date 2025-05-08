@@ -4,6 +4,7 @@
 //
 //  Created by Sebastian Beckmann on 2022-09-30.
 //  Changed by Patrick Heyer on 2022-10-16.
+//  Modified to support multiple formats by <your name/assistant>.
 //
 
 import CoreMediaIO
@@ -12,81 +13,104 @@ import os.log
 
 class OBSCameraStreamSource: NSObject, CMIOExtensionStreamSource {
     private(set) var stream: CMIOExtensionStream!
-
     let device: CMIOExtensionDevice
 
-    private let _streamFormat: CMIOExtensionStreamFormat
+    /// All formats supported by this stream
+    private let _streamFormats: [CMIOExtensionStreamFormat]
 
-    init(
-        localizedName: String, streamID: UUID, streamFormat: CMIOExtensionStreamFormat,
-        device: CMIOExtensionDevice
-    ) {
-        self.device = device
-        self._streamFormat = streamFormat
-        super.init()
-        self.stream = CMIOExtensionStream(
-            localizedName: localizedName,
-            streamID: streamID,
-            direction: .source,
-            clockType: .hostTime,
-            source: self
-        )
-    }
-
-    var formats: [CMIOExtensionStreamFormat] {
-        return [_streamFormat]
-    }
-
+    /// Index of the currently active format in _streamFormats
     var activeFormatIndex: Int = 0 {
-        didSet {
-            if activeFormatIndex >= 1 {
-                os_log(.error, "Invalid index")
-            }
-        }
+	didSet {
+	    if activeFormatIndex < 0 || activeFormatIndex >= _streamFormats.count {
+		os_log(.error, "Invalid source format index %d", activeFormatIndex)
+	    }
+	}
     }
 
+    init(localizedName: String,
+	 streamID: UUID,
+	 streamFormats: [CMIOExtensionStreamFormat],
+	 device: CMIOExtensionDevice)
+    {
+	self.device = device
+	self._streamFormats = streamFormats
+	super.init()
+	// Create the underlying CMIOExtensionStream
+	self.stream = CMIOExtensionStream(
+	    localizedName: localizedName,
+	    streamID: streamID,
+	    direction: .source,
+	    clockType: .hostTime,
+	    source: self
+	)
+    }
+
+    /// Expose the list of possible formats
+    var formats: [CMIOExtensionStreamFormat] {
+	return _streamFormats
+    }
+
+    /// Which stream properties do we support?
     var availableProperties: Set<CMIOExtensionProperty> {
-        return [.streamActiveFormatIndex, .streamFrameDuration]
+	return [.streamActiveFormatIndex, .streamFrameDuration]
     }
 
     func streamProperties(forProperties properties: Set<CMIOExtensionProperty>) throws
-        -> CMIOExtensionStreamProperties
+	-> CMIOExtensionStreamProperties
     {
-        let streamProperties = CMIOExtensionStreamProperties(dictionary: [:])
+	let streamProps = CMIOExtensionStreamProperties(dictionary: [:])
+	for prop in properties {
+	    switch prop {
+	    case .streamActiveFormatIndex:
+		streamProps.activeFormatIndex = activeFormatIndex
 
-        if properties.contains(.streamActiveFormatIndex) {
-            streamProperties.activeFormatIndex = 0
-        }
-        if properties.contains(.streamFrameDuration) {
-            let frameDuration = CMTime(value: 1, timescale: Int32(OBSCameraFrameRate))
-            streamProperties.frameDuration = frameDuration
-        }
+	    case .streamFrameDuration:
+		// Use global OBSCameraFrameRate
+		let frameDuration = CMTime(value: 1, timescale: Int32(OBSCameraFrameRate))
+		streamProps.frameDuration = frameDuration
 
-        return streamProperties
+	    default:
+		break
+	    }
+	}
+	return streamProps
     }
 
     func setStreamProperties(_ streamProperties: CMIOExtensionStreamProperties) throws {
-        if let activeFormatIndex = streamProperties.activeFormatIndex {
-            self.activeFormatIndex = activeFormatIndex
-        }
+	// If the client wants to change the active format index, do so.
+	if let newIndex = streamProperties.activeFormatIndex {
+	    if newIndex >= 0, newIndex < _streamFormats.count {
+		if newIndex != activeFormatIndex {
+		    os_log(.info, "Source stream: changing activeFormatIndex to %d", newIndex)
+		    activeFormatIndex = newIndex
+
+		    // Update the device to switch the resolution
+		    if let deviceSource = device.source as? OBSCameraDeviceSource {
+			deviceSource.setActiveFormat(newIndex)
+		    }
+		}
+	    } else {
+		os_log(.error, "Requested out-of-range format index for source: %d", newIndex)
+	    }
+	}
     }
 
     func authorizedToStartStream(for client: CMIOExtensionClient) -> Bool {
-        return true
+	// Optionally, we could check entitlements, etc. For now, allow all.
+	return true
     }
 
     func startStream() throws {
-        guard let deviceSource = device.source as? OBSCameraDeviceSource else {
-            fatalError("Unexpected source type \(String(describing: device.source))")
-        }
-
-        deviceSource.startStreaming()
+	guard let deviceSource = device.source as? OBSCameraDeviceSource else {
+	    fatalError("Unexpected device source in startStream()")
+	}
+	deviceSource.startStreaming()
     }
 
     func stopStream() throws {
-        guard let deviceSource = device.source as? OBSCameraDeviceSource else {
-            fatalError("Unexpcted source type \(String(describing: device.source))")
-        }
-        deviceSource.stopStreaming()
+	guard let deviceSource = device.source as? OBSCameraDeviceSource else {
+	    fatalError("Unexpected device source in stopStream()")
+	}
+	deviceSource.stopStreaming()
     }
 }
